@@ -1,11 +1,11 @@
-# Hemere - 初心者パイロット用超軽量HPA最適設計システム
+# Hemere - 超軽量HPA最適設計システム
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)
 
 ## 📋 プロジェクト概要
 
-**Hemere** は、初心者パイロット向けの超軽量人力飛行機（HPA: Human Powered Aircraft）の最適設計を行うシステムです。
+**Hemere** は、超軽量人力飛行機（HPA: Human Powered Aircraft）の最適設計を行うシステムです。
 
 与えられた飛行条件（スパン、速度、許容たわみ等）に対して、**β（翼根曲げモーメント比）と積層構成を同時に最適化**し、誘導抗力を最小化する設計を自動探索します。
 
