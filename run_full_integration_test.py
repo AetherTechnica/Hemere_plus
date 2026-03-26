@@ -101,7 +101,8 @@ def run_integration_sweep(cond_id, beta_min=0.97, beta_max=1.01, n_beta=9, verbo
         delta_allow_m       = cond['delta_allow_m'],
         sigma_allow_MPa     = cond['sigma_allow_MPa'],
         mandrel_diameters_mm= cond['mandrel_D'],
-        n_segments          = 8,
+        n_spar              = 8,
+        n_aero              = 100,
     )
 
     integrator = DesignIntegratorV3(params)
