@@ -501,12 +501,56 @@ mandrel_diameters_mm = np.linspace(120, 45, 8)  # 8セグメント
 
 ---
 
-## 10. 次の開発ステップ
+## 10. 次の開発ステップと現在の進捗
 
 **方針**: コードを書く前に物理モデルを確立する（B方針）。
 surrogateモデルや最適化の前に、基盤となる物理計算の正しさを担保する。
 
-### Phase B-1: EI_req 逆算の物理式を確立
+### ✅ 完了済み（2026-03-26）
+
+#### Step 1: 物理モデル検証 - spar_calculator
+- `calculate_spec()` に返値追加: `I_mm4`, `D_outer_mm`
+- 検証: D=120mm, ply=[1,4,6,1,0,0,0,0,1,1,1] → EI=1.4363×10¹⁰ kgf·mm²（エクセル値と 誤差0.003%）
+
+#### Step 2: 物理モデル検証 - aerodynamics_analyzer
+- TR-797法実装の正確性確認
+- opt-ATLAS の `calculateAerodynamics` と完全一致（差0.000%）
+
+#### Step 3: 物理モデル検証 - structural_analyzer
+- 曲げモーメント・たわみ計算の検証
+- 応力計算の修正: E固定の不正確さを廃止 → I_mm4, D_outer_mm を直接受け取り
+- scipy 依存を除去（`_cumtrapz` 純NumPy実装）
+- opt-ATLAS と完全一致（差0.000%）
+
+#### Step 4-1: バグ修正（4ファイル）
+1. ✅ `spar_calculator.py`: API 返値追加
+2. ✅ `structural_analyzer.py`: scipy 除去、check_strength API 変更
+3. ✅ `snap_optimizer.py`: calculate_spec() 新返値に対応
+4. ✅ `design_integrator_v3.py`: キー名不整合修正、solutions[0] 追加、check_strength 新API、単位変換（N·mm² ↔ kgf·mm²）
+
+#### Step 4-2: ei_estimator.py の新規実装
+- **ファイル**: `C:\Users\Shidw\HPA\Hemere\src\core\ei_estimator.py`
+- **実装内容**:
+  ```python
+  class EIEstimator:
+      def calc_EI_req(self, M_Nm: np.ndarray, y_m: np.ndarray, delta_allow_m: float) -> np.ndarray:
+          """
+          M比例形状法 + 二分法で EI_req を逆算
+
+          アルゴリズム:
+          1. EI_shape(y) = |M(y)| / max(|M(y)|)  （正規化されたモーメント形状）
+          2. EI_req(y) = α × EI_shape(y)  （EI がモーメントに比例と仮定）
+          3. 二分法で α を決定: compute_deflection(M, α × EI_shape) の翼端たわみが delta_allow になるように
+          4. 返却: EI_req_Nmm2 [N·mm²]
+
+          Returns:
+              np.ndarray: EI_req の分布 [N·mm²]
+          """
+  ```
+
+### ⏳ 進行中 / 保留
+
+#### Phase B-1: EI_req 逆算の物理式を確立
 
 **目標**: `M(y)` と `δ_allow` から `EI_req(y)` を求める式を決める。
 
@@ -534,6 +578,32 @@ EI_dist を自由変数として、δ_tip(EI_dist) = δ_allow を満たす
 
 → **opt-ATLAS との整合性確認**: opt-ATLAS では EI が先に決まってから δ を計算する
 （順方向）。Hemere での逆問題は opt-ATLAS にはない概念のため、慎重に設計する。
+
+### Phase B-1-1: M比例形状法の検証テスト
+
+設計後、下記の検証スクリプトで動作確認:
+
+```bash
+cd C:\Users\Shidw\HPA\Hemere
+/c/Users/Shidw/anaconda3/python.exe -c "
+import numpy as np, sys; sys.path.insert(0,'.')
+from src.core.ei_estimator import EIEstimator
+from src.structural.structural_analyzer import StructuralAnalyzer
+
+# テストケース: 単純な集中荷重下での梁
+y = np.linspace(0, 16, 200)
+M = 0.5 * 100 * (16 - y)**2  # 集中荷重のモーメント分布
+
+est = EIEstimator()
+EI_req = est.calc_EI_req(M, y, 0.8192)
+
+sa = StructuralAnalyzer(y)
+d, _ = sa.compute_deflection(M, EI_req)
+
+print('delta_tip =', d[-1]*1000, 'mm (期待値: 819.2 mm)')
+print('EI_req min/max =', np.min(EI_req), '/', np.max(EI_req), '[N*mm^2]')
+"
+```
 
 ### Phase B-2: surrogate モデルの問題特定
 
@@ -632,6 +702,85 @@ Z_dist[Z_dist < 1e-3] = 1e-3
 | EI_req 逆算の方法 | 未確立。強度計算と曲率分布の問題。数式化できていない |
 | 積層逆算の方法 | 解析的逆算（二分法）で最小 n_cap を求める。製造可否チェックもここで |
 | scipy が使えるか | pip 外部遮断のため使用不可。純 NumPy で実装 |
+
+---
+
+---
+
+## 12. Step 4 実装の課題と対策
+
+### バグ修正内容（4ファイル完了）
+
+#### 課題①: spar_calculator の返値不足
+```python
+# Before:
+return total_EIx_kgf, total_weight_kg_m, total_thickness_mm
+
+# After:
+total_I_mm4 = float(np.sum(Ix))          # 断面二次モーメント合計
+D_outer_mm  = float(outer_dia[-1])       # 最外層外径
+return total_EIx_kgf, total_weight_kg_m, total_thickness_mm, total_I_mm4, D_outer_mm
+```
+
+#### 課題②: structural_analyzer の scipy 依存
+```python
+# Before:
+from scipy.integrate import cumulative_trapezoid
+
+# After:
+@staticmethod
+def _cumtrapz(y: np.ndarray, x: np.ndarray, initial: float = 0.0) -> np.ndarray:
+    """scipy.integrate.cumulative_trapezoid の純NumPy実装"""
+    dx = np.diff(x)
+    trapz = (y[:-1] + y[1:]) * dx / 2.0
+    return np.concatenate([[initial], np.cumsum(trapz)])
+```
+
+#### 課題③: check_strength の E固定
+```python
+# Before:
+E_assumed = 100e9  # [Pa] 固定
+
+# After:
+def check_strength(self, moment_Nm: np.ndarray,
+                   I_dist_mm4: np.ndarray,
+                   D_outer_dist_mm: np.ndarray) -> np.ndarray:
+    """σ = M * c / I  （c = 外半径）"""
+    I_m4 = I_dist_mm4 * 1e-12
+    c_m  = D_outer_dist_mm / 1000.0 / 2.0
+    stress = np.abs(moment_Nm) * c_m / (I_m4 + 1e-18)
+    return stress / 1e6  # MPa
+```
+
+#### 課題④: design_integrator_v3 のキー名不整合
+```python
+# Before:
+s['Actual_EI'], s['Actual_Weight']  # ← 実は存在しないキー
+
+# After:
+s['EI'], s['Weight']  # ← snap_optimizer が返す正しいキー
+solutions[0]          # ← solve() はリストを返すので [0] を取得
+```
+
+### 単位変換の追加（design_integrator_v3）
+
+```python
+# EI_req は ei_estimator から [N*mm²] で返される
+# snap_optimizer は [kgf*mm²] を期待するので変換必須
+target_ei_kgf = target_ei_dist / self.g  # N*mm² → kgf*mm²
+solutions = self.snap_opt.solve(target_ei_kgf)
+
+# 逆に actual_ei は [kgf*mm²] なので
+# compute_deflection に渡す際は [N*mm²] に変換
+final_deflection, _ = self.struct.compute_deflection(final_moment, actual_ei * self.g)
+```
+
+### 実行状況
+
+2026-03-26 時点での実行:
+- パイプラインは起動可能（ただし処理中断）
+- snapshot 群（snap_optimizer による逐段探索）は正常に実行されている
+- 最終的な検証には ei_estimator.py の実装が必須
 
 ---
 
