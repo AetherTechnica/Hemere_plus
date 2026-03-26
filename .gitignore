@@ -2,9 +2,12 @@
 __pycache__/
 *.pyc
 
-# Data & Results (‹‘å‰»‚µ‚â‚·‚¢ƒtƒHƒ‹ƒ_‚ğGit‚©‚çœŠO)
+# Data & Results
 data/
 results/
 *.pkl
 *.joblib
 *.csv
+
+# ã‚°ãƒ©ãƒ•ãƒ»ç”»åƒå‡ºåŠ›
+*.png

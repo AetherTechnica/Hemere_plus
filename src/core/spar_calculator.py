@@ -46,7 +46,13 @@ class SparCalculator:
             diameter_mm (float): マンドレル直径 (mm)
 
         Returns:
-            tuple: (EI [Nmm^2], Weight [kg/m], TotalThickness [mm])
+            tuple: (
+                EI [kgf*mm^2],
+                Weight [kg/m],
+                TotalThickness [mm],
+                I_mm4 [mm^4],       全層合計の断面二次モーメント
+                D_outer_mm [mm]     最外層の外径
+            )
         """
         n_layers = 11
         
@@ -109,7 +115,9 @@ class SparCalculator:
         total_weight_kg_m = np.sum(weights_layer)
         total_thickness_mm = np.sum(thickness)
 
-        return total_EIx_kgf, total_weight_kg_m, total_thickness_mm
+        total_I_mm4 = float(np.sum(Ix))   # 全層の断面二次モーメント合計 [mm^4]
+        D_outer_mm  = float(outer_dia[-1]) # 最外層外径 [mm]
+        return total_EIx_kgf, total_weight_kg_m, total_thickness_mm, total_I_mm4, D_outer_mm
 
 if __name__ == "__main__":
     # --- 簡易動作テスト ---

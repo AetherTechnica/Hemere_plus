@@ -1,163 +1,163 @@
 import numpy as np
 import pandas as pd
 import joblib
-import os
-import sys
 import itertools
+from pathlib import Path
+import sys
+import logging
 
-# プロジェクトルートにパスを通す
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+# プロジェクトルートのパス解決
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.append(str(PROJECT_ROOT))
 
+# 必要なモジュールのインポート
 from src.core.spar_calculator import SparCalculator
+from src.models.eos_surrogate import add_physics_features, inverse_log10
 
-# モデルパス
-MODEL_PATH = os.path.join("results", "models", "spar_weight_surrogate_model_eos_xgb.pkl")
-
-# =========================================================
-# モデル読み込みに必要な関数定義 (Pickle対策)
-# =========================================================
-def add_physics_features(X):
-    """モデル学習時と同じ特徴量生成"""
-    log_ei = X[:, 0]
-    r = X[:, 1]
-    log_r = np.log10(r + 1e-9)
-    thickness_index = log_ei - 3 * log_r
-    return np.column_stack((X, thickness_index))
-
-def inverse_log10(x):
-    """Log10の逆変換"""
-    return 10**x
+# ロギング設定
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
 # =========================================================
-# Snap Optimizer クラス
+# Snap Optimizer クラス (物理スナップ対応版)
 # =========================================================
 class SnapOptimizer:
-    def __init__(self):
-        # 1. 計算エンジンの初期化
+    def __init__(self, model_name="spar_weight_surrogate_model_eos_xgb.pkl"):
+        """
+        AIによる重量推算と物理計算による積層確定を統合するクラス．
+        """
         self.calc = SparCalculator()
+        self.model_path = PROJECT_ROOT / "results" / "models" / model_name
         
-        # 2. AIモデル(Eos)の読み込み
-        if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError(f"Eos Model not found at {MODEL_PATH}. Run eos_surrogate.py first.")
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"Eos Model not found at {self.model_path}. Run eos_surrogate.py first.")
         
-        print(f"Loading Eos Engine from {MODEL_PATH}...")
-        self.eos_model = joblib.load(MODEL_PATH)
+        logger.info(f"Loading Eos Engine from {self.model_path}...")
+        # add_physics_featuresなどが正しく読み込まれるよう設定
+        self.eos_model = joblib.load(self.model_path)
         
-        # 探索設定
-        self.r_search_step = 0.5  # AI探索時の刻み幅 (mm)
-        self.snap_range = 5.0     # AI推奨値の前後何mmを精密探索するか
-        self.snap_step = 1.0      # 精密探索時の刻み幅 (mm) -> マンドレル刻みに合わせる
+        # 探索設定 (デフォルト値)
+        self.r_min = 30.0
+        self.r_max = 130.0
+        self.r_search_step = 0.5
+        self.snap_range = 5.0
+        self.snap_step = 1.0  # マンドレル刻み
+        self.buckling_limit = 150.0  # D/t 制約
 
     def predict_ideal_spec(self, target_EI):
         """
-        Phase 1: Eosモデルによる理想値(連続値)の探索
+        Phase 1: Eosモデルによる理想直径(R)の探索
         """
-        # 30mm ~ 130mm を粗くスキャン
-        r_scan = np.arange(30.0, 131.0, self.r_search_step)
+        r_scan = np.arange(self.r_min, self.r_max + self.r_search_step, self.r_search_step)
         
-        # 入力作成 [LogEI, R]
+        # 特徴量作成: [Log10(EI), R]
         log_ei = np.log10(target_EI)
         ei_col = np.full_like(r_scan, log_ei)
         X_scan = np.column_stack((ei_col, r_scan))
         
-        # 爆速推論
+        # 推論実行
         pred_weights = self.eos_model.predict(X_scan)
         
-        # 最適点（最小重量）を見つける
         best_idx = np.argmin(pred_weights)
-        ideal_r = r_scan[best_idx]
-        ideal_w = pred_weights[best_idx]
-        
-        return ideal_r, ideal_w
+        return r_scan[best_idx], pred_weights[best_idx]
 
-    def snap_to_physics(self, target_EI, ideal_r):
+    def get_feasible_ply_patterns(self):
+        """
+        製造可能な積層パターンのジェネレータ
+        """
+        base_options = range(10)
+        cap_options = itertools.product(range(3), repeat=7)
+        for base_ply, caps in itertools.product(base_options, cap_options):
+            ply_counts = np.zeros(11, dtype=int)
+            ply_counts[0] = 1   # Glass (In)
+            ply_counts[1] = 2   # Torque
+            ply_counts[2] = base_ply
+            ply_counts[3:10] = caps
+            ply_counts[10] = 1  # Glass (Out)
+            yield ply_counts
+
+    def snap_to_physics(self, target_EI, ideal_r, top_n=3):
         """
         Phase 2: 物理スナップ
-        理想直径の周辺で、実際に製造可能な積層パターンを探索し、
-        要求剛性を満たす最軽量解を確定させる。
+        要求剛性と座屈制約を満たす設計を理想直径の周辺で全探索し，上位N件を返す．
         """
-        # 1. 探索範囲の決定 (AI推奨値 ± snap_range)
-        r_min = max(30.0, ideal_r - self.snap_range)
-        r_max = min(130.0, ideal_r + self.snap_range)
+        r_start = max(self.r_min, np.floor(ideal_r - self.snap_range))
+        r_end = min(self.r_max, np.ceil(ideal_r + self.snap_range))
+        candidate_diameters = np.arange(r_start, r_end + self.snap_step, self.snap_step)
         
-        # マンドレル径は通常1mm刻みなどを想定
-        candidate_diameters = np.arange(np.floor(r_min), np.ceil(r_max) + 1.0, self.snap_step)
+        feasible_solutions = []
         
-        best_spec = None
-        min_weight = float('inf')
-        
-        # 積層パターンの生成 (ある程度絞り込んで探索)
-        # Base層: 0~9, Cap層: 0~2 (全探索に近いが、範囲を絞るロジックを入れても良い)
-        # ここでは単純化のため、dataset作成時と同じ全探索ロジックを回す
-        # (ただし直径が数点しかないので一瞬で終わる)
-        base_options = range(10)
-        cap_options = list(itertools.product(range(3), repeat=7))
-        
-        # --- 精密探索ループ ---
         for D in candidate_diameters:
-            # 固定層定義
-            ply_counts = np.zeros(11, dtype=int)
-            ply_counts[0] = 1; ply_counts[10] = 1; ply_counts[1] = 2
+            for ply_counts in self.get_feasible_ply_patterns():
+                # 物理スペック計算
+                real_EI, real_W, t_total, real_I_mm4, real_D_outer = \
+                    self.calc.calculate_spec(ply_counts, D)
 
-            for base_ply in base_options:
-                ply_counts[2] = base_ply
-                for cap_config in cap_options:
-                    ply_counts[3:10] = cap_config
-                    
-                    # 物理計算 (SparCalculator)
-                    real_EI, real_W, t_total = self.calc.calculate_spec(ply_counts, D)
-                    
-                    # 判定: 剛性が足りているか？
-                    if real_EI >= target_EI:
-                        # 判定: 今までのベストより軽いか？
-                        if real_W < min_weight:
-                            min_weight = real_W
-                            best_spec = {
-                                "Diameter": D,
-                                "Actual_EI": real_EI,
-                                "Actual_Weight": real_W,
-                                "Thickness": t_total,
-                                "Ply_Config": ply_counts.copy().tolist(),
-                                "Margin_Pct": (real_EI - target_EI) / target_EI * 100
-                            }
-                            
-        return best_spec
+                # 1. 剛性制約チェック
+                if real_EI < target_EI:
+                    continue
+
+                # 2. 座屈制約チェック (D/t)
+                if (D / t_total) > self.buckling_limit:
+                    continue
+
+                # 解の保存（I_mm4, D_outer_mm を追加）
+                feasible_solutions.append({
+                    "Diameter": D,
+                    "Weight": real_W,
+                    "EI": real_EI,
+                    "Thickness": t_total,
+                    "D_t": D / t_total,
+                    "Ply_Config": ply_counts.tolist(),
+                    "Margin_Pct": (real_EI - target_EI) / target_EI * 100,
+                    "I_mm4": real_I_mm4,
+                    "D_outer_mm": real_D_outer,
+                })
+        
+        # 重量の昇順でソートして上位を返す
+        sorted_sol = sorted(feasible_solutions, key=lambda x: x["Weight"])
+        return sorted_sol[:top_n]
 
     def solve(self, target_EI):
         """
-        メイン処理: AI探索 -> 物理スナップ
+        メイン最適化フロー: AIナビゲーション -> 物理スナップ確定
         """
-        print(f"Target EI: {target_EI:.2e}")
+        logger.info(f"Solving for Target EI: {target_EI:.2e} Nmm^2")
         
         # Step 1: AIによるナビゲーション
         ideal_r, ideal_w = self.predict_ideal_spec(target_EI)
-        print(f"  [AI Guide] Ideal Diameter: {ideal_r:.1f} mm (Approx Weight: {ideal_w:.4f} kg/m)")
+        logger.info(f"AI Guide -> Ideal Diameter: {ideal_r:.1f} mm, Est. Weight: {ideal_w:.4f} kg/m")
         
-        # Step 2: 物理スナップによる確定
-        print(f"  [Physics Snap] Searching feasible specs around {ideal_r:.1f} mm...")
-        final_spec = self.snap_to_physics(target_EI, ideal_r)
+        # Step 2: 物理スナップ
+        solutions = self.snap_to_physics(target_EI, ideal_r)
         
-        if final_spec:
-            print(f"  ✅ Solution Found!")
-            print(f"     Diameter    : {final_spec['Diameter']} mm")
-            print(f"     Weight      : {final_spec['Actual_Weight']:.4f} kg/m")
-            print(f"     Stiffness   : {final_spec['Actual_EI']:.2e} (Margin: +{final_spec['Margin_Pct']:.1f}%)")
-            print(f"     Ply Config  : {final_spec['Ply_Config']}")
-            print("-" * 30)
-            return final_spec
-        else:
-            print("  ❌ No feasible solution found in the search range.")
+        if not solutions:
+            logger.error("No feasible solution found with current constraints.")
             return None
+        
+        # 結果の出力
+        best = solutions[0]
+        logger.info("✅ Best Physical Solution Found:")
+        logger.info(f"   - Diameter  : {best['Diameter']:.1f} mm")
+        logger.info(f"   - Weight    : {best['Weight']:.4f} kg/m")
+        logger.info(f"   - Margin    : +{best['Margin_Pct']:.2f} %")
+        logger.info(f"   - D/t Ratio : {best['D_t']:.1f} (Limit: {self.buckling_limit})")
+        logger.info(f"   - Ply Config: {best['Ply_Config']}")
+        
+        return solutions
 
 # =========================================================
 # 実行部
 # =========================================================
 if __name__ == "__main__":
-    optimizer = SnapOptimizer()
+    opt = SnapOptimizer()
     
-    # テストケース: いくつかの剛性値を試す
-    test_targets = [1.0e9, 3.0e9,5.0e9,8.0e9,1.0e10,1.4e10]
+    # テスト用剛性 (5e10 Nmm^2)
+    test_ei = 4.0e9
+    results = opt.solve(test_ei)
     
-    for ei in test_targets:
-        print("\n" + "="*40)
-        optimizer.solve(ei)
+    if results:
+        # 他の候補も表示してみる
+        print("\n--- Alternative Solutions ---")
+        for i, res in enumerate(results[1:], 2):
+            print(f"Rank {i}: R={res['Diameter']:.1f}, W={res['Weight']:.4f}, Margin={res['Margin_Pct']:.1f}%")
