@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -15,8 +16,13 @@ class SpanOptimizerConfig:
     max_d_over_t: float | None = None
     min_foreaft_ratio: float | None = None
     max_candidates_per_station: int = 80
+    ei_diversity_bins_per_station: int = 0
     beam_width: int = 500
     max_exhaustive_combinations: int = 200_000
+    enforce_monotone_cap_plies: bool = False
+    require_common_phi_nonincreasing: bool = False
+    max_cap_ply_drop_per_transition: int | None = None
+    max_phi_change_deg_per_transition: int | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,10 @@ class SpanOptimizer:
     def __init__(self, config: SpanOptimizerConfig):
         if config.delta_allow_m <= 0.0:
             raise ValueError("delta_allow_m must be positive")
+        if config.max_cap_ply_drop_per_transition is not None and config.max_cap_ply_drop_per_transition < 0:
+            raise ValueError("max_cap_ply_drop_per_transition must be non-negative")
+        if config.max_phi_change_deg_per_transition is not None and config.max_phi_change_deg_per_transition < 0:
+            raise ValueError("max_phi_change_deg_per_transition must be non-negative")
         self.config = config
 
     def solve(self, stations: tuple[SpanStation, ...] | list[SpanStation]) -> SpanOptimizationResult:
@@ -100,8 +110,7 @@ class SpanOptimizer:
                     continue
             kept.append(candidate)
 
-        kept.sort(key=lambda c: (c.weight_kg_m, -c.EI_vertical_Nmm2))
-        return tuple(kept[: self.config.max_candidates_per_station])
+        return tuple(select_station_candidates(kept, self.config))
 
     def _solve_exhaustive(
         self,
@@ -111,6 +120,8 @@ class SpanOptimizer:
         best_feasible: SpanOptimizationResult | None = None
         best_any: SpanOptimizationResult | None = None
         for choices in itertools.product(*candidates_by_station):
+            if not self._transitions_allowed(choices):
+                continue
             result = self._evaluate_choices(stations, tuple(choices))
             if best_any is None or result.deflection_tip_m < best_any.deflection_tip_m:
                 best_any = result
@@ -121,7 +132,15 @@ class SpanOptimizer:
 
         if best_feasible is not None:
             return best_feasible
-        assert best_any is not None
+        if best_any is None:
+            return SpanOptimizationResult(
+                feasible=False,
+                total_weight_kg=float("inf"),
+                half_weight_kg=float("inf"),
+                deflection_tip_m=float("inf"),
+                choices=tuple(),
+                reason="no combination satisfies transition constraints",
+            )
         return SpanOptimizationResult(
             feasible=False,
             total_weight_kg=best_any.total_weight_kg,
@@ -141,6 +160,8 @@ class SpanOptimizer:
             next_states: list[_PartialSpanState] = []
             for state in states:
                 for candidate in candidates:
+                    if state.choices and not self._transition_allowed(state.choices[-1], candidate):
+                        continue
                     weight = state.half_weight_kg + candidate.weight_kg_m * station.width_m
                     compliance = (
                         state.compliance_score
@@ -153,8 +174,16 @@ class SpanOptimizer:
                             compliance_score=compliance,
                         )
                     )
-            next_states.sort(key=lambda s: (s.half_weight_kg, s.compliance_score))
-            states = next_states[: self.config.beam_width]
+            if not next_states:
+                return SpanOptimizationResult(
+                    feasible=False,
+                    total_weight_kg=float("inf"),
+                    half_weight_kg=float("inf"),
+                    deflection_tip_m=float("inf"),
+                    choices=tuple(),
+                    reason="no beam state satisfies transition constraints",
+                )
+            states = select_beam_states(next_states, self.config.beam_width)
 
         evaluated = [self._evaluate_choices(stations, state.choices) for state in states]
         feasible = [result for result in evaluated if result.feasible]
@@ -199,6 +228,116 @@ class SpanOptimizer:
         theta = _cumtrapz(curvature, y)
         deflection = _cumtrapz(theta, y)
         return float(deflection[-1])
+
+    def _transitions_allowed(self, choices: tuple[SectionCandidate, ...]) -> bool:
+        return all(
+            self._transition_allowed(prev, cur)
+            for prev, cur in zip(choices[:-1], choices[1:])
+        )
+
+    def _transition_allowed(self, rootward: SectionCandidate, tipward: SectionCandidate) -> bool:
+        return transition_allowed(
+            rootward,
+            tipward,
+            enforce_monotone_cap_plies=self.config.enforce_monotone_cap_plies,
+            require_common_phi_nonincreasing=self.config.require_common_phi_nonincreasing,
+            max_cap_ply_drop_per_transition=self.config.max_cap_ply_drop_per_transition,
+            max_phi_change_deg_per_transition=self.config.max_phi_change_deg_per_transition,
+        )
+
+
+def transition_allowed(
+    rootward: SectionCandidate,
+    tipward: SectionCandidate,
+    *,
+    enforce_monotone_cap_plies: bool = False,
+    require_common_phi_nonincreasing: bool = False,
+    max_cap_ply_drop_per_transition: int | None = None,
+    max_phi_change_deg_per_transition: int | None = None,
+) -> bool:
+    """Return whether a root-to-tip section transition is manufacturable enough."""
+    root_phis = rootward.cap_phis
+    tip_phis = tipward.cap_phis
+
+    if enforce_monotone_cap_plies and len(tip_phis) > len(root_phis):
+        return False
+
+    if max_cap_ply_drop_per_transition is not None:
+        if len(root_phis) - len(tip_phis) > max_cap_ply_drop_per_transition:
+            return False
+
+    for root_phi, tip_phi in zip(root_phis, tip_phis):
+        if require_common_phi_nonincreasing and tip_phi > root_phi:
+            return False
+        if max_phi_change_deg_per_transition is not None:
+            if abs(tip_phi - root_phi) > max_phi_change_deg_per_transition:
+                return False
+    return True
+
+
+def select_station_candidates(
+    candidates: list[SectionCandidate],
+    config: SpanOptimizerConfig,
+) -> list[SectionCandidate]:
+    if not candidates:
+        return []
+    if config.ei_diversity_bins_per_station <= 0:
+        candidates.sort(key=lambda c: (c.weight_kg_m, -c.EI_vertical_Nmm2))
+        return candidates[: config.max_candidates_per_station]
+
+    by_bin: dict[int, SectionCandidate] = {}
+    ei_values = [max(candidate.EI_vertical_Nmm2, 1e-30) for candidate in candidates]
+    log_min = math.log10(min(ei_values))
+    log_max = math.log10(max(ei_values))
+    span = max(log_max - log_min, 1e-12)
+    bin_count = max(config.ei_diversity_bins_per_station, 1)
+
+    for candidate in candidates:
+        normalized = (math.log10(max(candidate.EI_vertical_Nmm2, 1e-30)) - log_min) / span
+        bin_index = min(bin_count - 1, max(0, int(normalized * bin_count)))
+        old = by_bin.get(bin_index)
+        if old is None or candidate.weight_kg_m < old.weight_kg_m:
+            by_bin[bin_index] = candidate
+
+    selected = list(by_bin.values())
+    selected.sort(key=lambda c: (c.weight_kg_m, -c.EI_vertical_Nmm2))
+    if len(selected) >= config.max_candidates_per_station:
+        return selected[: config.max_candidates_per_station]
+
+    selected_keys = {candidate.cap_phis for candidate in selected}
+    remaining = [candidate for candidate in candidates if candidate.cap_phis not in selected_keys]
+    remaining.sort(key=lambda c: (c.weight_kg_m, -c.EI_vertical_Nmm2))
+    selected.extend(remaining)
+    return selected[: config.max_candidates_per_station]
+
+
+def select_beam_states(
+    states: list[_PartialSpanState],
+    beam_width: int,
+) -> list[_PartialSpanState]:
+    if len(states) <= beam_width:
+        return states
+
+    weight_quota = max(1, beam_width // 2)
+    compliance_quota = beam_width - weight_quota
+    selected: list[_PartialSpanState] = []
+    selected_keys: set[tuple[tuple[int, ...], ...]] = set()
+
+    for state in sorted(states, key=lambda s: (s.half_weight_kg, s.compliance_score))[:weight_quota]:
+        key = tuple(choice.cap_phis for choice in state.choices)
+        selected.append(state)
+        selected_keys.add(key)
+
+    for state in sorted(states, key=lambda s: (s.compliance_score, s.half_weight_kg)):
+        if len(selected) >= beam_width:
+            break
+        key = tuple(choice.cap_phis for choice in state.choices)
+        if key in selected_keys:
+            continue
+        selected.append(state)
+        selected_keys.add(key)
+
+    return selected
 
 
 def infer_station_widths(y_m: np.ndarray) -> np.ndarray:

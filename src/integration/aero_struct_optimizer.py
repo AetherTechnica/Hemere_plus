@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from src.aerodynamics.aerodynamics_analyzer import AerodynamicsAnalyzer, AircraftAeroParams
-from src.core.laminate_grammar import LaminateGrammar, LaminateGrammarConfig
+from src.core.laminate_grammar import LaminateGrammar, LaminateGrammarConfig, LaminateState
 from src.core.section_calculator import SectionCalculator
-from src.core.section_frontier import FrontierConfig, SectionFrontierBuilder
+from src.core.section_frontier import FrontierConfig, SectionCandidate, SectionFrontierBuilder
+from src.core.section_table_io import StoredSectionDesignTable, load_section_design_tables_from_manifest
 from src.core.span_optimizer import (
     SpanOptimizationResult,
     SpanOptimizer,
@@ -49,10 +51,17 @@ class AeroStructOptimizerConfig:
     weight_tol_kg: float = 0.02
     grammar_config: LaminateGrammarConfig = LaminateGrammarConfig(max_total_cap_plies=18)
     frontier_config: FrontierConfig = FrontierConfig(max_states_per_depth=800, max_frontier_size=1500)
+    section_table_manifest_path: str | None = None
+    use_table_frontier_records: bool = False
     max_candidates_per_station: int = 60
+    ei_diversity_bins_per_station: int = 0
     beam_width: int = 400
     max_d_over_t: float | None = None
     min_foreaft_ratio: float | None = None
+    enforce_monotone_cap_plies: bool = False
+    require_common_phi_nonincreasing: bool = False
+    max_cap_ply_drop_per_transition: int | None = None
+    max_phi_change_deg_per_transition: int | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +94,7 @@ class AeroStructOptimizer:
             config=self.config.frontier_config,
         )
         self._frontier_cache: dict[float, list] = {}
+        self._section_tables = self._load_section_tables()
 
         dummy = self._build_aero(1.0)
         self.y_aero = dummy.y
@@ -193,15 +203,58 @@ class AeroStructOptimizer:
             max_d_over_t=self.config.max_d_over_t,
             min_foreaft_ratio=self.config.min_foreaft_ratio,
             max_candidates_per_station=self.config.max_candidates_per_station,
+            ei_diversity_bins_per_station=self.config.ei_diversity_bins_per_station,
             beam_width=self.config.beam_width,
+            enforce_monotone_cap_plies=self.config.enforce_monotone_cap_plies,
+            require_common_phi_nonincreasing=self.config.require_common_phi_nonincreasing,
+            max_cap_ply_drop_per_transition=self.config.max_cap_ply_drop_per_transition,
+            max_phi_change_deg_per_transition=self.config.max_phi_change_deg_per_transition,
         )
         return SpanOptimizer(span_config).solve(tuple(stations))
 
     def _frontier_for(self, diameter_mm: float):
         key = round(diameter_mm, 6)
         if key not in self._frontier_cache:
-            self._frontier_cache[key] = self.frontier_builder.build(diameter_mm)
+            table = self._section_tables.get(key) if self._section_tables else None
+            if table is not None:
+                self._frontier_cache[key] = self._candidates_from_table(table)
+            else:
+                self._frontier_cache[key] = self.frontier_builder.build(diameter_mm)
         return self._frontier_cache[key]
+
+    def _load_section_tables(self) -> dict[float, StoredSectionDesignTable]:
+        if not self.config.section_table_manifest_path:
+            return {}
+        return load_section_design_tables_from_manifest(Path(self.config.section_table_manifest_path))
+
+    def _candidates_from_table(self, table: StoredSectionDesignTable) -> list[SectionCandidate]:
+        records = table.frontier_records if self.config.use_table_frontier_records else tuple(
+            entry.section for entry in table.entries
+        )
+        unique_cap_phis = sorted({record.cap_phis for record in records}, key=lambda phis: (len(phis), phis))
+        candidates: list[SectionCandidate] = []
+        for cap_phis in unique_cap_phis:
+            stack = self.grammar.build_stack(cap_phis)
+            section = self.calculator.evaluate(table.diameter_mm, stack)
+            state = self._state_for_cap_phis(cap_phis)
+            candidates.append(
+                SectionCandidate(
+                    cap_phis=cap_phis,
+                    stack=stack,
+                    section=section,
+                    grammar_state=state,
+                )
+            )
+        return candidates
+
+    def _state_for_cap_phis(self, cap_phis: tuple[int, ...]) -> LaminateState:
+        state = self.grammar.initial_state()
+        for phi in cap_phis:
+            next_state = self.grammar.append_phi(state, phi)
+            if next_state is None:
+                raise ValueError(f"stored table contains invalid cap Phi sequence: {cap_phis}")
+            state = next_state
+        return state
 
     def _build_aero(self, W_total_kg: float) -> AerodynamicsAnalyzer:
         p = self.params

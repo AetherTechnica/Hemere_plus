@@ -30,7 +30,7 @@ def compute_diameter_batch(D, base_options, cap_options):
         for cap_config in cap_options:
             ply_counts[3:10] = cap_config
             
-            EI, W, t_total = calc.calculate_spec(ply_counts, D)
+            EI, W, t_total, _, _ = calc.calculate_spec(ply_counts, D)
             
             # 【重要】座屈制約の導入: D/tが大きすぎるペラペラの桁は除外
             if (D / t_total) <= 120.0:

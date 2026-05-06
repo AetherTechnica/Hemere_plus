@@ -127,7 +127,7 @@ if __name__ == "__main__":
     test_ply = np.array([1,2,1,1,1,1,1,1,1,1,1]) #np.array配列で入力
     test_dia = 100.0 # mm
     
-    ei, weight, t = calc.calculate_spec(test_ply, test_dia)
+    ei, weight, t, _, _ = calc.calculate_spec(test_ply, test_dia)
     
     print(f"--- SparCalculator Test ---")
     print(f"Diameter: {test_dia} mm")

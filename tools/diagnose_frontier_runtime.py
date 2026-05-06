@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -63,6 +66,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--approx-prefix-pruning", action="store_true")
     parser.add_argument("--approx-bin-pruning", action="store_true")
     parser.add_argument("--representatives", type=int, default=3)
+    parser.add_argument(
+        "--output-json",
+        default=None,
+        help="Optional path for a machine-readable runtime diagnosis report.",
+    )
     return parser.parse_args()
 
 
@@ -96,6 +104,8 @@ def main() -> None:
     stats = [diagnose_diameter(builder, diameter, args.representatives) for diameter in diameters]
     print_table(stats)
     print_summary(stats)
+    if args.output_json:
+        write_json_report(args, diameters, grammar_config, frontier_config, stats, Path(args.output_json))
 
 
 def diagnose_diameter(
@@ -173,6 +183,57 @@ def print_summary(stats: list[FrontierStats]) -> None:
         print(f"largest_frontier=D{largest.diameter_mm:.1f}mm size={largest.frontier_size}")
     if slowest is not None:
         print(f"slowest_build=D{slowest.diameter_mm:.1f}mm time_s={slowest.elapsed_s:.3f}")
+
+
+def write_json_report(
+    args: argparse.Namespace,
+    diameters: tuple[float, ...],
+    grammar_config: LaminateGrammarConfig,
+    frontier_config: FrontierConfig,
+    stats: list[FrontierStats],
+    path: Path,
+) -> None:
+    payload: dict[str, Any] = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "config": {
+            "diameters_mm": list(diameters),
+            "grammar_config": grammar_config.__dict__,
+            "frontier_config": frontier_config.__dict__,
+            "representatives": args.representatives,
+        },
+        "summary": {
+            "total_time_s": sum(item.elapsed_s for item in stats),
+            "largest_frontier": stat_identity(max(stats, key=lambda item: item.frontier_size, default=None)),
+            "slowest_build": stat_identity(max(stats, key=lambda item: item.elapsed_s, default=None)),
+        },
+        "diameters": [stat_record(item) for item in stats],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"json report -> {path}")
+
+
+def stat_identity(item: FrontierStats | None) -> dict[str, float | int] | None:
+    if item is None:
+        return None
+    return {
+        "diameter_mm": item.diameter_mm,
+        "frontier_size": item.frontier_size,
+        "elapsed_s": item.elapsed_s,
+    }
+
+
+def stat_record(item: FrontierStats) -> dict[str, Any]:
+    return {
+        "diameter_mm": item.diameter_mm,
+        "frontier_size": item.frontier_size,
+        "elapsed_s": item.elapsed_s,
+        "weight_range_kg_m": list(item.weight_range_kg_m) if item.weight_range_kg_m else None,
+        "ei_vertical_range_Nmm2": list(item.ei_vertical_range_Nmm2) if item.ei_vertical_range_Nmm2 else None,
+        "ei_foreaft_range_Nmm2": list(item.ei_foreaft_range_Nmm2) if item.ei_foreaft_range_Nmm2 else None,
+        "d_over_t_range": list(item.d_over_t_range) if item.d_over_t_range else None,
+        "representative_cap_phis": [list(seq) for seq in item.representative_cap_phis],
+    }
 
 
 def representative_cap_phis(

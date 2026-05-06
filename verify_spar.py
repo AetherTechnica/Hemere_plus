@@ -169,14 +169,14 @@ def verify_R_mm_interpretation():
 
     # Hemere で同じ条件を「直径=90mm」で計算
     print("  --- Hemere で diameter_mm=90（R_mm=90 を直径として解釈） ---")
-    EI_hem_90, w_90, t_90 = hemere_full_wrap(n_0deg, 90.0)
+    EI_hem_90, w_90, t_90, _, _ = hemere_full_wrap(n_0deg, 90.0)
     print(f"  EI: {EI_hem_90:.4e} kgf*mm^2")
     print(f"  Weight: {w_90:.4f} kg/m")
 
     # Hemere で同じ条件を「直径=180mm」で計算（R=90を半径として解釈）
     print()
     print("  --- Hemere で diameter_mm=180（R_mm=90 を半径として解釈） ---")
-    EI_hem_180, w_180, t_180 = hemere_full_wrap(n_0deg, 180.0)
+    EI_hem_180, w_180, t_180, _, _ = hemere_full_wrap(n_0deg, 180.0)
     print(f"  EI: {EI_hem_180:.4e} kgf*mm^2")
     print(f"  Weight: {w_180:.4f} kg/m")
 
@@ -203,7 +203,7 @@ def verify_handover_value():
     ply_counts = np.array([1, 4, 6, 1, 0, 0, 0, 0, 1, 1, 1], dtype=float)
     diameter_mm = 120.0
 
-    EI, weight, thickness = calc.calculate_spec(ply_counts, diameter_mm)
+    EI, weight, thickness, _, _ = calc.calculate_spec(ply_counts, diameter_mm)
 
     print("=== 引き継ぎ資料の検証値確認 ===")
     print(f"  入力: diameter={diameter_mm}mm, ply={ply_counts.astype(int).tolist()}")
@@ -247,7 +247,7 @@ def verify_atlas_condition3():
         EI_atlas, _, _, _, _, _, _ = opt_atlas_calculate_stiffness(ply_num, pp_atlas, R)
 
         # Hemere で diameter=R として比較（直径解釈）
-        EI_hem, _, _ = hemere_full_wrap(n, R)
+        EI_hem, _, _, _, _ = hemere_full_wrap(n, R)
 
         diff = abs(EI_atlas - EI_hem) / EI_atlas * 100 if EI_atlas > 0 else float('inf')
         print(f"  {j:>3} {R:>8.1f} {n:>8} {EI_atlas:>22.4e} {EI_hem:>22.4e} {diff:>8.3f}%")

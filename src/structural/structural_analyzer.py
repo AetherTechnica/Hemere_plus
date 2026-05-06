@@ -33,7 +33,7 @@ class StructuralAnalyzer:
         moment = np.zeros(self.n)
         for i in range(self.n - 1):
             dist = self.y[i:] - self.y[i]
-            moment[i] = np.trapz(net_load_N_m[i:] * dist, self.y[i:])
+            moment[i] = np.trapezoid(net_load_N_m[i:] * dist, self.y[i:])
         moment[-1] = 0.0
         return moment
 

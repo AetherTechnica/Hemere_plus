@@ -63,7 +63,7 @@ def opt_atlas_structural(y_m, Net_Load_Nm, EI_kgfmm2):
     M_Nm = np.zeros(N)
     for i in range(N - 1):
         dist = y_m[i:] - y_m[i]
-        M_Nm[i] = np.trapz(Net_Load_Nm[i:] * dist, y_m[i:])
+        M_Nm[i] = np.trapezoid(Net_Load_Nm[i:] * dist, y_m[i:])
     M_Nm[N-1] = 0.0
 
     # 単位換算: N*m -> kgf*mm
@@ -92,7 +92,7 @@ def hemere_structural(y_m, Net_Load_Nm, EI_Nmm2):
     M_Nm = np.zeros(N)
     for i in range(N - 1):
         dist = y_m[i:] - y_m[i]
-        M_Nm[i] = np.trapz(Net_Load_Nm[i:] * dist, y_m[i:])
+        M_Nm[i] = np.trapezoid(Net_Load_Nm[i:] * dist, y_m[i:])
     M_Nm[N-1] = 0.0
 
     # --- たわみ計算（Hemere: N*m^2 系）---
@@ -225,7 +225,7 @@ def verify_atlas_condition3_full():
         ply_counts[2]  = n_0deg_opt[j]  # 40t 0deg（主要曲げ層）← 全周扱い
         ply_counts[10] = 1              # 24t 保護層
 
-        EI_kgf, w_kg_per_m, t_mm = calc.calculate_spec(ply_counts, mandrel_D_mm[j])
+        EI_kgf, w_kg_per_m, t_mm, _, _ = calc.calculate_spec(ply_counts, mandrel_D_mm[j])
         EI_kgfmm2_dist[j] = EI_kgf
         w_struct_dist[j]   = w_kg_per_m * g  # [N/m]
 
@@ -294,7 +294,7 @@ def check_strength_issue():
     from src.core.spar_calculator import SparCalculator
     calc = SparCalculator()
     ply = np.array([1, 2, 8, 1, 0, 0, 0, 0, 1, 1, 1], dtype=float)  # 典型的な翼根
-    EI_kgf, w, t = calc.calculate_spec(ply, 90.0)
+    EI_kgf, w, t, _, _ = calc.calculate_spec(ply, 90.0)
     EI_Nmm2_real = EI_kgf * 9.80665
 
     # spar_calculator の内部計算で I を直接取得するには？
